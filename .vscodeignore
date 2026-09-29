@@ -1,0 +1,13 @@
+.vscode/**
+src/**
+test/**
+out/**
+node_modules/**
+tsconfig.json
+.gitignore
+*.vsix
+**/*.map
+media/make-icon.py
+media/icon-128.png
+**/__pycache__/**
+media/icon.svg
