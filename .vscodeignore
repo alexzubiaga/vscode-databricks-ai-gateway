@@ -2,7 +2,9 @@
 src/**
 test/**
 out/**
+docs/**
 node_modules/**
+!README.md
 tsconfig.json
 .gitignore
 *.vsix
