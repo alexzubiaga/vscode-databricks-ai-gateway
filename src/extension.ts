@@ -3,18 +3,18 @@ import { AuthManager, NotSignedInError, gatewayConfigOrThrow } from './auth';
 import { GatewayAuthenticationProvider } from './authProvider';
 import { ClaudeCodeConfigurator, claudeSettingsPath } from './claudeCode';
 import { ConfigurationError, VENDOR_ID, readConfig, requireWorkspaceOrigin } from './config';
+import { initLog, log } from './log';
 import { OneMProbeCache, discoverModels } from './models';
 import { describe } from './oauth';
 import { GatewayChatProvider, SessionState } from './provider';
 import {
-  StatusMenuAction,
-  StatusSnapshot,
-  buildStatusMenu,
-  describeSnapshot,
+    StatusMenuAction,
+    StatusSnapshot,
+    buildStatusMenu,
+    describeSnapshot,
 } from './statusMenu';
 import { TokenService } from './tokenService';
 import { Workspace, chooseWorkspace } from './workspaces';
-import { initLog, log } from './log';
 
 const WORKSPACE_STATE_KEY = 'databricksAigw.workspace';
 const CLAUDE_CODE_STATE_KEY = 'databricksAigw.claudeCodeConfigured';
@@ -211,7 +211,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
+  const ensureAccountId = async (): Promise<void> => {
+    const section = vscode.workspace.getConfiguration('databricksAigw');
+    const current = (section.get<string>('accountId') ?? '').trim();
+    if (/^[0-9a-f-]{36}$/i.test(current)) {
+      return;
+    }
+    const input = await vscode.window.showInputBox({
+      title: 'Databricks Account ID',
+      prompt: 'Enter your Databricks account UUID',
+      placeHolder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+      validateInput: (value) =>
+        /^[0-9a-f-]{36}$/i.test(value.trim()) ? undefined : 'Must be a valid UUID',
+    });
+    if (!input) {
+      throw new vscode.CancellationError();
+    }
+    await section.update('accountId', input.trim(), vscode.ConfigurationTarget.Global);
+  };
+
   const signIn = async (): Promise<void> => {
+    await ensureAccountId();
     const config = gatewayConfigOrThrow();
     await tokenService.start(config.tokenServicePort);
 
@@ -291,6 +311,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const selectWorkspace = async (): Promise<void> => {
+    await ensureAccountId();
     const config = gatewayConfigOrThrow();
     if (!(await auth.hasStoredCredential())) {
       await signIn();
@@ -323,6 +344,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   };
 
   const configureClaudeCodeInteractive = async (): Promise<void> => {
+    await ensureAccountId();
     const config = gatewayConfigOrThrow();
     const active = session ?? (await resolveSession(false));
     if (!active) {
