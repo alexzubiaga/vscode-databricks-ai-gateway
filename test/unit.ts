@@ -11,7 +11,7 @@ import {
   supportsOneMContext,
   withOneMVariants
 } from '../src/models';
-import { GatewayChatProvider, SessionState, toAnthropicMessages } from '../src/provider';
+import { GatewayChatProvider, SessionState, applyCacheBreakpoints, toAnthropicMessages } from '../src/provider';
 import { StatusSnapshot, buildStatusMenu, describeSnapshot } from '../src/statusMenu';
 import { filterWorkspaces } from '../src/workspaces';
 
@@ -122,6 +122,33 @@ test('messages: text turns map to Anthropic roles', () => {
     { role: 'user', content: [{ type: 'text', text: 'hello' }] },
     { role: 'assistant', content: [{ type: 'text', text: 'hi' }] },
   ]);
+});
+
+test('cache: breakpoints land on the last tool and the last message block only', () => {
+  const body = {
+    model: 'm',
+    max_tokens: 1,
+    tools: [
+      { name: 'a', input_schema: { type: 'object' } },
+      { name: 'b', input_schema: { type: 'object' } },
+    ],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'one' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'two' }] },
+      { role: 'user', content: [{ type: 'text', text: 'x' }, { type: 'text', text: 'three' }] },
+    ],
+  } as never as Parameters<typeof applyCacheBreakpoints>[0];
+  applyCacheBreakpoints(body);
+  const ephemeral = { type: 'ephemeral' };
+  assert.equal((body.tools![0] as { cache_control?: unknown }).cache_control, undefined);
+  assert.deepEqual((body.tools![1] as { cache_control?: unknown }).cache_control, ephemeral);
+  const marked = body.messages.flatMap((m) => (m.content as Array<{ cache_control?: unknown }>))
+    .filter((b) => b.cache_control);
+  assert.equal(marked.length, 1);
+  assert.deepEqual(
+    (body.messages[2]!.content as Array<{ cache_control?: unknown }>)[1]!.cache_control,
+    ephemeral,
+  );
 });
 
 test('messages: a leading assistant turn is dropped so the history starts with user', () => {

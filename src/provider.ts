@@ -200,6 +200,7 @@ export class GatewayChatProvider implements vscode.LanguageModelChatProvider {
       messages: anthropicMessages,
       ...toolParams(options),
     };
+    applyCacheBreakpoints(body);
 
     await this.streamOnce(session, body, progress, token, /* allowRetry */ true, isOneMVariant(model.id));
   }
@@ -239,6 +240,7 @@ export class GatewayChatProvider implements vscode.LanguageModelChatProvider {
       // would report a truncated tool call the user never asked to complete.
       if (!cancelled) {
         relay.finish();
+        relay.logUsage(String(body.model));
       }
       return;
     } catch (error) {
@@ -276,6 +278,40 @@ export class GatewayChatProvider implements vscode.LanguageModelChatProvider {
     // only used for VS Code's own budgeting, never for billing.
     const content = typeof text === 'string' ? text : plainTextOf(text);
     return Math.ceil(content.length / 4);
+  }
+}
+
+type CacheableBlock = Extract<
+  ContentBlockParam,
+  { type: 'text' | 'image' | 'tool_use' | 'tool_result' }
+>;
+
+function isCacheable(block: ContentBlockParam): block is CacheableBlock {
+  return (
+    block.type === 'text' ||
+    block.type === 'image' ||
+    block.type === 'tool_use' ||
+    block.type === 'tool_result'
+  );
+}
+
+/**
+ * Marks the end of the tool list and of the conversation as cache breakpoints.
+ * The tools-and-earlier-turns prefix is then reused by the next turn, which
+ * extends the same prefix.
+ */
+export function applyCacheBreakpoints(body: Anthropic.MessageStreamParams): void {
+  const lastTool = body.tools?.[body.tools.length - 1];
+  if (lastTool && 'input_schema' in lastTool) {
+    lastTool.cache_control = { type: 'ephemeral' };
+  }
+
+  const lastMessage = body.messages[body.messages.length - 1];
+  if (lastMessage && Array.isArray(lastMessage.content)) {
+    const lastBlock = lastMessage.content[lastMessage.content.length - 1];
+    if (lastBlock && isCacheable(lastBlock)) {
+      lastBlock.cache_control = { type: 'ephemeral' };
+    }
   }
 }
 
@@ -445,11 +481,48 @@ function toDataBlock(
  */
 class StreamRelay {
   private readonly pendingTools = new Map<number, { id: string; name: string; json: string }>();
+  private usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+  private sawUsage = false;
 
   constructor(private readonly progress: vscode.Progress<vscode.LanguageModelResponsePart>) {}
 
+  logUsage(model: string): void {
+    if (!this.sawUsage) {
+      log.debug(`Gateway reported no usage for ${model}.`);
+      return;
+    }
+    const { input, cacheRead, cacheWrite, output } = this.usage;
+    log.info(
+      `Usage for ${model}: input=${input} cache_read=${cacheRead} cache_write=${cacheWrite} output=${output}.`,
+    );
+  }
+
   handle(event: MessageStreamEvent): void {
     switch (event.type) {
+      case 'message_start': {
+        const usage = event.message.usage;
+        log.debug(`message_start usage: ${JSON.stringify(usage)}`);
+        this.sawUsage = true;
+        this.usage.input = usage.input_tokens ?? 0;
+        this.usage.cacheRead = usage.cache_read_input_tokens ?? 0;
+        this.usage.cacheWrite = usage.cache_creation_input_tokens ?? 0;
+        this.usage.output = usage.output_tokens ?? 0;
+        return;
+      }
+
+      case 'message_delta': {
+        // Fields here are cumulative; some gateways only fill them in at the end.
+        const usage = event.usage;
+        log.debug(`message_delta usage: ${JSON.stringify(usage)}`);
+        this.sawUsage = true;
+        this.usage.output = usage.output_tokens ?? this.usage.output;
+        this.usage.input = usage.input_tokens ?? this.usage.input;
+        // A delta that restates a cache count as 0 must not erase the value from message_start.
+        this.usage.cacheRead = Math.max(this.usage.cacheRead, usage.cache_read_input_tokens ?? 0);
+        this.usage.cacheWrite = Math.max(this.usage.cacheWrite, usage.cache_creation_input_tokens ?? 0);
+        return;
+      }
+
       case 'content_block_start':
         if (event.content_block.type === 'tool_use') {
           this.pendingTools.set(event.index, {
