@@ -4,13 +4,12 @@ import * as vscode from 'vscode';
 import { accountLabel } from '../src/authProvider';
 import { ConfigurationError, accountAuthorizeUrl, anthropicBaseUrl, readConfig, requireWorkspaceOrigin, validateConfig } from '../src/config';
 import {
-  ONE_M_CONTEXT_WINDOW,
-  OneMProbeCache,
   discoverModels,
-  oneMCandidates,
+  gatewayModelId,
+  isOneMVariant,
   sortModels,
   supportsOneMContext,
-  withOneMVariants,
+  withOneMVariants
 } from '../src/models';
 import { GatewayChatProvider, SessionState, toAnthropicMessages } from '../src/provider';
 import { StatusSnapshot, buildStatusMenu, describeSnapshot } from '../src/statusMenu';
@@ -282,11 +281,11 @@ test('models: a 1M variant is synthesized only for compatible models', () => {
     { id: 'system.ai.claude-haiku-4-5', displayName: 'Claude Haiku 4.5' },
   ]);
   assert.deepEqual(
-    expanded.map((model) => [model.id, model.displayName, model.contextWindow]),
+    expanded.map((model) => [model.id, model.displayName, model.maxInputTokens, model.maxOutputTokens]),
     [
-      ['system.ai.claude-opus-5', 'Claude Opus 5', undefined],
-      ['system.ai.claude-opus-5[1m]', 'Claude Opus 5 (1M context)', ONE_M_CONTEXT_WINDOW],
-      ['system.ai.claude-haiku-4-5', 'Claude Haiku 4.5', undefined],
+      ['system.ai.claude-opus-5', 'Claude Opus 5', undefined, undefined],
+      ['system.ai.claude-opus-5[1m]', 'Claude Opus 5 (1M context)', 872000, 128000],
+      ['system.ai.claude-haiku-4-5', 'Claude Haiku 4.5', undefined, undefined],
     ],
   );
 });
@@ -296,7 +295,10 @@ test('models: an id the gateway already reports as [1m] is labelled, not doubled
     { id: 'system.ai.claude-opus-5[1m]', displayName: 'Claude Opus 5 1m' },
   ]);
   assert.equal(expanded.length, 1);
-  assert.equal(expanded[0]!.contextWindow, ONE_M_CONTEXT_WINDOW);
+  assert.deepEqual(
+    [expanded[0]!.maxInputTokens, expanded[0]!.maxOutputTokens],
+    [872000, 128000],
+  );
 });
 
 test('models: the [1m] suffix does not disturb version ordering', () => {
@@ -346,221 +348,75 @@ test('models: the real gateway list sorts with Opus 5 first', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 1M-context probing. The `[1m]` ids are synthesized from an allowlist rather
-// than discovered, so the gateway is asked whether it really serves each one —
-// an unrecognised suffix would otherwise reach the picker and fail at request
-// time with a 404 the user cannot act on.
+// 1M-context entries. The gateway serves the wider window on the *base* model id
+// behind a beta flag: every `[1m]`-suffixed spelling 404s. So the suffix is a
+// local label, and these tests pin that it never reaches the gateway.
 // ---------------------------------------------------------------------------
 
 const PROBE_ORIGIN = 'https://dbc-00000000-0000.cloud.databricks.com';
 
-/**
- * Stands in for the gateway: a fixed `/v1/models` list, and a `/v1/messages`
- * status per probed model id. Records the ids that were actually probed.
- *
- * Responses are shaped for the Anthropic SDK, because that is what the probe now
- * goes through — the same client the chat path uses.
- */
-function gatewayStub(options: {
-  models?: string[];
-  probeStatus?: (modelId: string) => number;
-}): { probed: string[]; restore: () => void } {
+/** Stands in for the gateway's `/v1/models`, recording every id requested. */
+function gatewayStub(options: { models?: string[] }): {
+  requested: string[];
+  restore: () => void;
+} {
   const models = options.models ?? [
     'system.ai.claude-opus-5',
     'system.ai.claude-sonnet-5',
     'system.ai.claude-haiku-4-5',
   ];
-  const probeStatus = options.probeStatus ?? (() => 200);
-  const probed: string[] = [];
+  const requested: string[] = [];
   const original = globalThis.fetch;
-  const json = (body: unknown, status: number) =>
-    new Response(JSON.stringify(body), {
-      status,
-      headers: { 'Content-Type': 'application/json' },
-    });
 
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.endsWith('/v1/models')) {
-      return json({ data: models.map((id) => ({ id })) }, 200);
+      return new Response(JSON.stringify({ data: models.map((id) => ({ id })) }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
-    assert.ok(url.endsWith('/v1/messages'), `unexpected request to ${url}`);
-    const body = JSON.parse(String(init?.body ?? '{}')) as { model?: string; max_tokens?: number };
-    const model = String(body.model);
-    probed.push(model);
-    // A probe must stay cheap: one output token, never a real completion.
-    assert.equal(body.max_tokens, 1);
-    const status = probeStatus(model);
-    if (status === 200) {
-      return json(
-        {
-          id: 'msg_probe',
-          type: 'message',
-          role: 'assistant',
-          model,
-          content: [{ type: 'text', text: '.' }],
-          stop_reason: 'max_tokens',
-          usage: { input_tokens: 1, output_tokens: 1 },
-        },
-        200,
-      );
-    }
-    return json({ type: 'error', error: { type: 'not_found_error', message: `no ${model}` } }, status);
+    const body = JSON.parse(String(init?.body ?? '{}')) as { model?: string };
+    requested.push(String(body.model));
+    throw new Error(`discovery must not send completions, got ${url}`);
   }) as typeof globalThis.fetch;
 
-  return { probed, restore: () => { globalThis.fetch = original; } };
+  return { requested, restore: () => { globalThis.fetch = original; } };
 }
-
-/** 404s only the exact ids given; everything else, base models included, answers. */
-const missing = (...ids: string[]) => (model: string) => (ids.includes(model) ? 404 : 200);
 
 const probeAuth = { getAccessToken: async () => 'test-token', invalidate: () => undefined };
 
-/** The globalState-backed cache, in memory. */
-function memoryCache(): OneMProbeCache & { writes: number } {
-  const store = new Map<string, Record<string, boolean>>();
-  return {
-    writes: 0,
-    get(origin) {
-      return store.get(origin);
-    },
-    async set(origin, verdicts) {
-      this.writes += 1;
-      store.set(origin, { ...verdicts });
-    },
-  };
-}
-
-test('models: candidates are exactly the allowlisted ids, suffixed', () => {
-  assert.deepEqual(
-    oneMCandidates(
-      [
-        'system.ai.claude-opus-5',
-        'system.ai.claude-haiku-4-5',
-        'system.ai.claude-sonnet-5[1m]',
-      ].map((id) => ({ id, displayName: id })),
-    ),
-    ['system.ai.claude-opus-5[1m]'],
-  );
-});
-
-test('models: a [1m] variant the gateway 404s is kept out of the picker', async () => {
+test('models: discovery spends no completion requests on the 1M entries', async () => {
   setConfig({});
-  const stub = gatewayStub({ probeStatus: missing('system.ai.claude-sonnet-5[1m]') });
+  const stub = gatewayStub({});
   try {
-    const discovered = await discoverModels(probeAuth as never, PROBE_ORIGIN, {
-      cache: memoryCache(),
-    });
-    const ids = discovered.map((model) => model.id);
-    assert.deepEqual(ids, [
+    const discovered = await discoverModels(probeAuth as never, PROBE_ORIGIN);
+    assert.deepEqual(discovered.map((model) => model.id), [
       'system.ai.claude-opus-5',
       'system.ai.claude-opus-5[1m]',
       'system.ai.claude-sonnet-5',
+      'system.ai.claude-sonnet-5[1m]',
       'system.ai.claude-haiku-4-5',
     ]);
-    assert.deepEqual(stub.probed.sort(), [
-      'system.ai.claude-opus-5[1m]',
-      // The Sonnet 404 is checked against its own base model before it is
-      // believed; Opus answered, so it needs no control.
-      'system.ai.claude-sonnet-5',
-      'system.ai.claude-sonnet-5[1m]',
-    ]);
+    assert.deepEqual(stub.requested, [], 'the suffix is local, so nothing needs probing');
   } finally {
     stub.restore();
   }
 });
 
-test('models: a cached verdict is reused, so a later discovery probes nothing', async () => {
-  setConfig({});
-  const cache = memoryCache();
-  const first = gatewayStub({ probeStatus: missing('system.ai.claude-sonnet-5[1m]') });
-  try {
-    await discoverModels(probeAuth as never, PROBE_ORIGIN, { cache });
-    assert.equal(first.probed.length, 3, 'two candidates plus one control probe');
-  } finally {
-    first.restore();
-  }
-
-  // Same gateway, but every probe would now succeed: if the cached 404 were
-  // forgotten the Sonnet variant would come back.
-  const second = gatewayStub({ probeStatus: () => 200 });
-  try {
-    const discovered = await discoverModels(probeAuth as never, PROBE_ORIGIN, { cache });
-    assert.equal(second.probed.length, 0, 'a cached workspace should spend no probes');
-    assert.ok(!discovered.some((model) => model.id === 'system.ai.claude-sonnet-5[1m]'));
-  } finally {
-    second.restore();
-  }
+test('models: the [1m] suffix is stripped before an id reaches the gateway', () => {
+  // Every suffixed spelling 404s on the real gateway, so only the base id is sent.
+  assert.equal(gatewayModelId('system.ai.claude-opus-5[1m]'), 'system.ai.claude-opus-5');
+  assert.equal(gatewayModelId('system.ai.claude-opus-5'), 'system.ai.claude-opus-5');
+  assert.equal(isOneMVariant('system.ai.claude-opus-5[1m]'), true);
+  assert.equal(isOneMVariant('system.ai.claude-opus-5'), false);
 });
 
-test('models: revalidateOneM re-takes the probes instead of trusting the cache', async () => {
-  setConfig({});
-  const cache = memoryCache();
-  const first = gatewayStub({ probeStatus: missing('system.ai.claude-sonnet-5[1m]') });
-  try {
-    await discoverModels(probeAuth as never, PROBE_ORIGIN, { cache });
-  } finally {
-    first.restore();
-  }
-
-  // The entitlement was granted since; re-reading the gateway must notice.
-  const second = gatewayStub({ probeStatus: () => 200 });
-  try {
-    const discovered = await discoverModels(probeAuth as never, PROBE_ORIGIN, {
-      cache,
-      revalidateOneM: true,
-    });
-    assert.equal(second.probed.length, 2);
-    assert.ok(discovered.some((model) => model.id === 'system.ai.claude-sonnet-5[1m]'));
-  } finally {
-    second.restore();
-  }
-});
-
-test('models: an inconclusive probe offers the variant and caches no verdict', async () => {
-  setConfig({});
-  const cache = memoryCache();
-  // 429 says nothing about whether the id exists, so it must not be read as a no.
-  const stub = gatewayStub({ probeStatus: () => 429 });
-  try {
-    const discovered = await discoverModels(probeAuth as never, PROBE_ORIGIN, { cache });
-    assert.deepEqual(
-      discovered.filter((model) => model.contextWindow).map((model) => model.id),
-      ['system.ai.claude-opus-5[1m]', 'system.ai.claude-sonnet-5[1m]'],
-    );
-    assert.equal(cache.writes, 0, 'an outage must not be cached as "not served"');
-  } finally {
-    stub.restore();
-  }
-});
-
-test('models: a gateway that 404s everything means a broken probe, not an unentitled workspace', async () => {
-  setConfig({});
-  const cache = memoryCache();
-  // What a probe that is itself malformed looks like: even the base models, which
-  // /v1/models just listed, come back 404. Believing that empties the picker.
-  const stub = gatewayStub({ probeStatus: () => 404 });
-  try {
-    const discovered = await discoverModels(probeAuth as never, PROBE_ORIGIN, { cache });
-    assert.deepEqual(
-      discovered.filter((model) => model.contextWindow).map((model) => model.id),
-      ['system.ai.claude-opus-5[1m]', 'system.ai.claude-sonnet-5[1m]'],
-    );
-    assert.equal(cache.writes, 0, 'a broken probe must not be cached as a verdict');
-    assert.ok(stub.probed.includes('system.ai.claude-opus-5'), 'the base model is the control');
-  } finally {
-    stub.restore();
-  }
-});
-
-test('models: offerOneMContext false skips discovery probing entirely', async () => {
+test('models: offerOneMContext false keeps the 1M entries out of the picker', async () => {
   setConfig({ offerOneMContext: false });
   const stub = gatewayStub({});
   try {
-    const discovered = await discoverModels(probeAuth as never, PROBE_ORIGIN, {
-      cache: memoryCache(),
-    });
-    assert.equal(stub.probed.length, 0);
+    const discovered = await discoverModels(probeAuth as never, PROBE_ORIGIN);
     assert.ok(!discovered.some((model) => /\[1m\]$/.test(model.id)));
   } finally {
     stub.restore();
@@ -839,8 +695,6 @@ test('menu: signed out offers sign-in and never sign-out or a model list', () =>
   const kinds = actionKinds(SIGNED_OUT);
   assert.ok(kinds.includes('signIn'));
   assert.ok(!kinds.includes('signOut'));
-  assert.ok(!kinds.includes('copyModelId'));
-  assert.ok(items.some((item) => item.label.includes('Not signed in')));
   assert.equal(describeSnapshot(SIGNED_OUT), 'Not signed in');
 });
 

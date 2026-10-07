@@ -2,3 +2,6 @@ node_modules/
 dist/
 out/
 __pycache__/
+
+*.vsix
+probe-out.txt

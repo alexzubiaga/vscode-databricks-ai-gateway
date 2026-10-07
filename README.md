@@ -93,14 +93,11 @@ still comes from the status bar or the command palette.
 | `databricksAigw.accountId` | Databricks account UUID | Same account the setup scripts use. |
 | `databricksAigw.workspaceFilter` | `costcenter` | Case-insensitive substring. Empty lists every workspace. |
 | `databricksAigw.redirectPort` | `8020` | Loopback OAuth redirect port. Databricks allowlists this for the `databricks-cli` public client, so changing it will usually break sign-in. |
-| `databricksAigw.maxInputTokens` | `200000` | Context window advertised to VS Code for the base models. **The gateway reports `0` for its own limits**, so this is a local declaration. The `(1M context)` entries declare their own window and ignore this. |
-| `databricksAigw.maxOutputTokens` | `64000` | Output cap advertised to VS Code. |
+| `databricksAigw.maxInputTokens` | `200000` | Context window advertised to VS Code for the base models. **The gateway reports `0` for its own limits**, so this is a local declaration. The `(1M context)` entries declare `872000` and ignore this. |
+| `databricksAigw.maxOutputTokens` | `64000` | Output cap advertised to VS Code for the base models. The `(1M context)` entries declare `128000`. |
 | `databricksAigw.offerOneMContext` | `true` | Offer the `(1M context)` entries. Set `false` on a workspace that is not entitled to the 1M window. |
 | `databricksAigw.configureClaudeCodeOnSignIn` | `true` | Set `false` to leave `~/.claude/settings.json` alone. |
 | `databricksAigw.tokenServicePort` | `0` | `0` picks a free loopback port per session. |
-
-**Select Workspace** and **Discover models** re-take the probes, which is what to
-run if a workspace's entitlements change.
 
 Both entries are listed, so the picker looks like this:
 
@@ -110,10 +107,13 @@ Both entries are listed, so the picker looks like this:
   ✦ Claude Haiku 4.5                                  …claude-haiku-4-5
 ```
 
+The `[1m]` suffix is this extension's own label and never reaches the gateway,
+which 404s every suffixed spelling. A request for a `(1M context)` entry is sent
+against the **base** model id with the `anthropic-beta: context-1m-2025-08-07`
+header, which is how the gateway opens the wider window.
+
 Haiku, older models and anything the gateway newly reports get no variant — the
-allowlist is deliberately a closed list rather than a guess, and the probe above
-catches the case where the list is right about the model but wrong about this
-workspace.
+allowlist is deliberately a closed list rather than a guess.
 
 Listing both rather than switching a global setting keeps the choice per request:
 the 1M window is charged at a higher rate, so it is worth spending deliberately.

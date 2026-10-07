@@ -4,32 +4,26 @@ import { GatewayAuthenticationProvider } from './authProvider';
 import { ClaudeCodeConfigurator, claudeSettingsPath } from './claudeCode';
 import { ConfigurationError, VENDOR_ID, readConfig, requireWorkspaceOrigin } from './config';
 import { initLog, log } from './log';
-import { OneMProbeCache, discoverModels } from './models';
+import { discoverModels } from './models';
 import { describe } from './oauth';
 import { GatewayChatProvider, SessionState } from './provider';
 import {
-    StatusMenuAction,
-    StatusSnapshot,
-    buildStatusMenu,
-    describeSnapshot,
+  StatusMenuAction,
+  StatusSnapshot,
+  buildStatusMenu,
+  describeSnapshot,
 } from './statusMenu';
 import { TokenService } from './tokenService';
 import { Workspace, chooseWorkspace } from './workspaces';
 
 const WORKSPACE_STATE_KEY = 'databricksAigw.workspace';
 const CLAUDE_CODE_STATE_KEY = 'databricksAigw.claudeCodeConfigured';
-/**
- * `{ [workspaceOrigin]: { [suffixedModelId]: served } }` — see {@link OneMProbeCache}.
- *
- * Versioned: the first build to probe did so with a hand-rolled request that
- * could 404 on its own account, and cached the result. Those verdicts are wrong
- * and would keep working models out of the picker, so the new key starts empty
- * rather than inheriting them.
- */
-const ONE_M_STATE_KEY = 'databricksAigw.oneMSupport.v2';
-const STALE_ONE_M_STATE_KEYS = ['databricksAigw.oneMSupport'];
 
-type OneMSupportState = Record<string, Record<string, boolean>>;
+/**
+ * Verdicts from the old `[1m]`-suffix probe, which the gateway 404s for every id.
+ * They recorded the 1M entries as unsupported and kept them out of the picker.
+ */
+const STALE_ONE_M_STATE_KEYS = ['databricksAigw.oneMSupport', 'databricksAigw.oneMSupport.v2'];
 
 interface StoredWorkspace {
   name: string;
@@ -43,28 +37,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const auth = new AuthManager(context.secrets);
   context.subscriptions.push(auth);
 
-  /**
-   * Remembers which `[1m]` ids each workspace answered to.
-   *
-   * Entitlements are a property of the workspace, not of the window, so the
-   * verdicts outlive both — otherwise every startup would re-spend a probe per
-   * candidate model.
-   */
   for (const stale of STALE_ONE_M_STATE_KEYS) {
     if (context.globalState.get(stale) !== undefined) {
       log.info(`Discarding 1M-context probe verdicts cached under ${stale}.`);
       void context.globalState.update(stale, undefined);
     }
   }
-
-  const oneMCache: OneMProbeCache = {
-    get: (workspaceOrigin) => context.globalState.get<OneMSupportState>(ONE_M_STATE_KEY)?.[workspaceOrigin],
-    set: async (workspaceOrigin, verdicts) => {
-      const all = { ...(context.globalState.get<OneMSupportState>(ONE_M_STATE_KEY) ?? {}) };
-      all[workspaceOrigin] = verdicts;
-      await context.globalState.update(ONE_M_STATE_KEY, all);
-    },
-  };
 
   const tokenService = new TokenService(auth);
   context.subscriptions.push({ dispose: () => tokenService.dispose() });
@@ -98,13 +76,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    *
    * `silent` distinguishes VS Code probing for models in the background (never
    * show a browser or a picker) from a user-driven command (prompting is fine).
-   * `revalidate` re-takes the 1M-context probes instead of trusting the cached
-   * verdicts, for when the user has explicitly asked to re-read the gateway.
    */
-  const resolveSession = async (
-    silent: boolean,
-    revalidate = false,
-  ): Promise<SessionState | undefined> => {
+  const resolveSession = async (silent: boolean): Promise<SessionState | undefined> => {
     if (session) {
       return session;
     }
@@ -113,6 +86,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     const attempt = (async () => {
       try {
+        if (!silent) {
+          // Prompt for the account ID here too: a non-silent resolve (e.g. the chat
+          // provider asking for models) must not fail with a config error before the
+          // user ever gets a chance to enter it.
+          await ensureAccountId();
+        }
         const config = gatewayConfigOrThrow();
         if (!(await auth.hasStoredCredential())) {
           if (silent) {
@@ -145,10 +124,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           } satisfies StoredWorkspace);
         }
 
-        const models = await discoverModels(auth, workspace.origin, {
-          cache: oneMCache,
-          revalidateOneM: revalidate,
-        });
+        const models = await discoverModels(auth, workspace.origin);
         session = {
           workspaceOrigin: workspace.origin,
           workspaceName: workspace.name,
@@ -256,7 +232,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         } satisfies StoredWorkspace);
 
         progress.report({ message: `Discovering models on ${workspace.name}…` });
-        const models = await discoverModels(auth, workspace.origin, { cache: oneMCache });
+        const models = await discoverModels(auth, workspace.origin);
         session = { workspaceOrigin: workspace.origin, workspaceName: workspace.name, models };
         updateStatus();
         provider.refresh();
@@ -298,7 +274,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const signOut = async (): Promise<void> => {
     await auth.signOut();
     await context.globalState.update(WORKSPACE_STATE_KEY, undefined);
-    await context.globalState.update(ONE_M_STATE_KEY, undefined);
     session = undefined;
     tokenService.dispose();
     await claudeCode.revert();
@@ -327,10 +302,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     } satisfies StoredWorkspace);
 
     await tokenService.start(config.tokenServicePort);
-    const models = await discoverModels(auth, workspace.origin, {
-      cache: oneMCache,
-      revalidateOneM: true,
-    });
+    const models = await discoverModels(auth, workspace.origin);
     session = { workspaceOrigin: workspace.origin, workspaceName: workspace.name, models };
     updateStatus();
     provider.refresh();
@@ -404,10 +376,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await selectWorkspace();
         return;
       case 'discoverModels': {
-        // Drop the cached list so the gateway is asked again rather than replayed,
-        // and re-take the 1M probes: this is the action for "the picker is wrong".
+        // Drop the cached list so the gateway is asked again rather than replayed.
         session = undefined;
-        const active = await resolveSession(false, /* revalidate */ true);
+        const active = await resolveSession(false);
         updateStatus();
         provider.refresh();
         void vscode.window.showInformationMessage(

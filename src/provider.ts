@@ -8,11 +8,11 @@ import type {
 } from '@anthropic-ai/sdk/resources/messages';
 import * as vscode from 'vscode';
 import { AuthManager, NotSignedInError } from './auth';
-import { GatewayConfig, readConfig } from './config';
+import { readConfig } from './config';
 import { createGatewayClient } from './gateway';
-import { GatewayModel } from './models';
-import { describe } from './oauth';
 import { log } from './log';
+import { GatewayModel, ONE_M_BETA, gatewayModelId, isOneMVariant } from './models';
+import { describe } from './oauth';
 
 /**
  * Backoff for re-resolving the session after a failed model listing.
@@ -109,9 +109,9 @@ export class GatewayChatProvider implements vscode.LanguageModelChatProvider {
       family: familyOf(model.id),
       version: model.id,
       // The gateway reports 0 for both limits, so these are local declarations.
-      // The `[1m]` entries carry their own window; everything else follows the setting.
-      maxInputTokens: model.contextWindow ?? config.maxInputTokens,
-      maxOutputTokens: config.maxOutputTokens,
+      // The `[1m]` entries carry their own limits; base models follow the settings.
+      maxInputTokens: model.maxInputTokens ?? config.maxInputTokens,
+      maxOutputTokens: model.maxOutputTokens ?? config.maxOutputTokens,
       tooltip: `${model.displayName} via Databricks AI Gateway (${session.workspaceName})`,
       detail: session.workspaceName,
       capabilities: {
@@ -190,15 +190,18 @@ export class GatewayChatProvider implements vscode.LanguageModelChatProvider {
     }
     const config = readConfig();
     const { messages: anthropicMessages } = toAnthropicMessages(messages);
+    const maxOutputTokens = model.maxOutputTokens ?? config.maxOutputTokens;
 
     const body: Anthropic.MessageStreamParams = {
-      model: model.id,
-      max_tokens: clampMaxTokens(options.modelOptions?.['max_tokens'], config),
+      // The `[1m]` suffix is this extension's label; the gateway serves the wider
+      // window on the base id behind the beta flag added in streamOnce.
+      model: gatewayModelId(model.id),
+      max_tokens: clampMaxTokens(options.modelOptions?.['max_tokens'], maxOutputTokens),
       messages: anthropicMessages,
       ...toolParams(options),
     };
 
-    await this.streamOnce(session, body, progress, token, /* allowRetry */ true);
+    await this.streamOnce(session, body, progress, token, /* allowRetry */ true, isOneMVariant(model.id));
   }
 
   /**
@@ -211,6 +214,7 @@ export class GatewayChatProvider implements vscode.LanguageModelChatProvider {
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken,
     allowRetry: boolean,
+    oneMContext = false,
   ): Promise<void> {
     const accessToken = await this.auth.getAccessToken();
     const client = this.createClient(session.workspaceOrigin, accessToken);
@@ -218,7 +222,10 @@ export class GatewayChatProvider implements vscode.LanguageModelChatProvider {
     const abort = new AbortController();
     const subscription = token.onCancellationRequested(() => abort.abort());
     try {
-      const stream = client.messages.stream(body, { signal: abort.signal });
+      const stream = client.messages.stream(body, {
+        signal: abort.signal,
+        ...(oneMContext ? { headers: { 'anthropic-beta': ONE_M_BETA } } : {}),
+      });
       const relay = new StreamRelay(progress);
       let cancelled = false;
       for await (const event of stream as AsyncIterable<MessageStreamEvent>) {
@@ -242,7 +249,7 @@ export class GatewayChatProvider implements vscode.LanguageModelChatProvider {
       if (allowRetry && isUnauthorized(error)) {
         log.debug('Gateway returned 401 mid-request; retrying once with a new token.');
         this.auth.invalidate(accessToken);
-        await this.streamOnce(session, body, progress, token, /* allowRetry */ false);
+        await this.streamOnce(session, body, progress, token, /* allowRetry */ false, oneMContext);
         return;
       }
       // translateError replaces the gateway's own wording with advice, so the
@@ -272,11 +279,11 @@ export class GatewayChatProvider implements vscode.LanguageModelChatProvider {
   }
 }
 
-function clampMaxTokens(requested: unknown, config: GatewayConfig): number {
+function clampMaxTokens(requested: unknown, maxOutputTokens: number): number {
   const value = typeof requested === 'number' && Number.isInteger(requested) && requested > 0
     ? requested
-    : config.maxOutputTokens;
-  return Math.min(value, config.maxOutputTokens);
+    : maxOutputTokens;
+  return Math.min(value, maxOutputTokens);
 }
 
 function toolParams(
